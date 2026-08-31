@@ -3,7 +3,7 @@ title: "おうちクラウド(ESXi/vCenter)環境をProxmox VEに移行した話
 emoji: "🖥️"
 type: "tech"
 topics: ["proxmox", "vmware", "esxi", "自宅サーバー", "仮想化"]
-published: false
+published: true
 ---
 
 ## はじめに
