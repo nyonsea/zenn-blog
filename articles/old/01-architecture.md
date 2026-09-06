@@ -3,7 +3,7 @@ title: "金融機関の電算部門を想定した、監査に耐えるデータ
 emoji: "🏦"
 type: "tech"
 topics: ["aws", "iceberg", "spark", "glue", "s3"]
-published: false
+published: true
 ---
 
 ## この記事は誰のためのものか
