@@ -46,7 +46,7 @@ published: false
 
 ドメインは`nyondev.local`、フォレスト機能レベル・ドメイン機能レベルともにWindows Server 2016。DC1⇔DC2間のAD複製は事前に正常性を確認済み（`repadmin /showrepl`で5パーティション全て成功）。
 
-## 3. UPN設計の判断：なぜ「A案」を選んだか
+## 3. UPN設計の判断
 
 Entra Connectを構成する前に、UPN（ユーザープリンシパル名）の扱いを決めておく必要があった。
 
