@@ -1,5 +1,5 @@
 ---
-title: "GuardDuty × EventBridge × Lambdaで組む、Organizationsクロスアカウント自動封じ込め ― 構築・検証編"
+title: "GuardDuty×EventBridge×Lambdaで組む、Organizationsクロスアカウント自動封じ込め ― 構築・検証編"
 emoji: "🔧"
 type: "tech"
 topics: ["aws", "security", "guardduty", "lambda", "eventbridge"]
@@ -54,9 +54,9 @@ published: false
 
 作業を始める前に、Account AでOrganizationsコンソールを開き、現在の組織構造を確認しておく。
 
-![Organizationsコンソールで組織構造を確認。管理アカウントとメンバーアカウントの一覧が見える](/images/organizations-console-overview.png)
-
 この画面で、既存のメンバーアカウント・OU構成を把握してから進める。今回は新たにAccount B・Cを作成するところから始める。
+
+![Organizationsコンソールで組織構造を確認。管理アカウントとメンバーアカウントの一覧が見える](/images/organizations-console-overview0.png)
 
 ### Account B・Cの新規作成
 
@@ -72,6 +72,9 @@ aws organizations create-account \
   --email "<your-address>+prodsim@gmail.com" \
   --account-name "prod-sim-account"
 ```
+
+
+![Organizationsコンソールで組織構造を確認。管理アカウントとメンバーアカウントの一覧が見える](/images/organizations-console-overview.png)
 
 **ここでハマった話**: 最初、上記のメールアドレスを別の適当な文字列で試したところ`EMAIL_ALREADY_EXISTS`で失敗した。
 
@@ -186,6 +189,8 @@ aws guardduty enable-organization-admin-account \
 
 両方とも成功時は空のレスポンスを返す仕様なので、エラーメッセージが表示されなければ成功と判断してよい。
 
+この2つは役割が違う。`enable-aws-service-access`は、Organizationsが持つアカウント一覧をGuardDuty側から参照できるようにする設定で、これを実行した時点で、まだGuardDutyを有効化していないアカウントも含め、組織内の全アカウントがGuardDutyの管理画面に「メンバーではない」というステータスで並ぶようになる。`enable-organization-admin-account`のほうは、そのうちの1つを委任管理者として指名する操作になる。
+
 ![enable-organization-admin-accountが成功した様子(空レスポンス)](/images/part1-02b-enable-admin-account-blank-success.png)
 
 ### Account B側でGuardDutyが自動有効化されているか確認する
@@ -204,6 +209,8 @@ aws guardduty list-detectors
 ```bash
 aws guardduty create-detector --enable
 ```
+
+検出器はリージョンごとに作られる。以降のGuardDutyのCLI操作はすべてこの検出器IDを引数に取るので、Account B・C双方のIDを控えておく。別リージョンで同じ構成を組む場合は、そのリージョンで改めて検出器IDを取得することになる。
 
 ### Account CをGuardDutyメンバーとして追加する
 
@@ -294,6 +301,23 @@ aws iam create-role \
 ![MalformedPolicyDocumentエラーが発生した様子](/images/part2-01-malformed-policy-error.png)
 
 原因は単純で、信頼ポリシーの`Principal`に指定したAccount B側のロールが、その時点でまだ存在していなかったこと。IAMはロール作成時に、信頼ポリシーで参照しているPrincipalの実在性をその場でチェックする。**信頼される側(Account BのLambda実行ロール)を先に作ってから、信頼する側(Account Cのロール)を作る**必要がある。
+
+### 権限ポリシーは通るのに、信頼ポリシーは弾かれる
+
+同じIAMポリシーでも、`Resource`に書いたARNと`Principal`に書いたARNでは扱いが違う。
+
+- **権限ポリシーの`Resource`は実在チェックされない**。単なる文字列として保存される。この後Account B側に付ける権限ポリシーには`arn:aws:iam::333333333333:role/SecurityOpsContainmentRole`と書くが、この時点でAccount C側にそのロールは存在しない。それでも`put-role-policy`は成功する
+- **信頼ポリシーの`Principal`は実在チェックされる**。「誰を信頼するか」の宣言なので、存在しない相手は登録させない。実在しないARNを書けば`MalformedPolicyDocument`で弾かれる
+
+この非対称性を踏まえると、手動で組む場合の順序は3ステップに整理できる。
+
+1. **実体が必要**: Account BにLambda実行ロールを作る
+2. **実体が必要**: 1が実在するので、それを`Principal`に指定したAccount C側のロールを作れる
+3. **文字列でよい**: Account Bのロールに、Account C側のロールをAssumeRoleする権限ポリシーを付ける
+
+3は`Resource`が実在チェックされないため、1と2の間に入れても通る。今回は実際に1 → 3 → 2の順で実行した。順序を気にせず進めたいなら1 → 2 → 3が安全側になる。いずれにせよ、絶対に入れ替えられないのは1と2の関係で、ここだけは崩せない。
+
+なお、Terraformのようなツールでコード化する場合、この依存関係は参照関係から自動的に解決されるので、人間が順番を計算する必要はなくなる。
 
 ### 正しい順序: まずAccount B側にLambda実行ロールを作る
 
@@ -464,19 +488,9 @@ aws sns create-topic --name guardduty-high-severity-alerts
 
 レスポンスの`TopicArn`を控える。
 
-### サブスクリプション登録でARNを間違えた話
+### サブスクリプションを登録する
 
-`subscribe`の`--topic-arn`に、直前の画面に表示されていた**別のARN**(自分自身のSTS認証情報のARN)を誤って貼り付けてしまい、エラーになった。
-
-```
-aws: [ERROR]: An error occurred (InvalidParameter) when calling the Subscribe operation:
-Invalid parameter: TopicArn Reason: A  ARN must begin with arn:null,
-not arn:aws:sts::222222222222:assumed-role/OrganizationAccountAccessRole/notify-setup
-```
-
-![subscribeでARNを間違えてInvalidParameterエラーになった様子](/images/part5-05-sns-subscribe-wrong-arn-error.png)
-
-正しくは、`create-topic`のレスポンスにあった`TopicArn`(`arn:aws:sns:...`)を使う。似たようなARN文字列が画面上に複数出てくると、コピー&ペースト時にどれを使うべきか混乱しやすい。都度、ARNの種類(`arn:aws:sns:`か`arn:aws:sts:`か)を確認する習慣が事故防止になる。
+通知の宛先としてメールアドレスを登録する。`--topic-arn`には`create-topic`のレスポンスで返ってきた`TopicArn`を指定する。
 
 ```bash
 aws sns subscribe \
@@ -484,8 +498,6 @@ aws sns subscribe \
   --protocol email \
   --notification-endpoint "<your-address>+secops@gmail.com"
 ```
-
-修正すると成功した。
 
 ![subscribeが成功し、SubscriptionArnがpending confirmationで返ってきた様子](/images/part5-06-sns-subscribe-success.png)
 
@@ -578,6 +590,32 @@ def lambda_handler(event, context):
 
 `iam_c.update_access_key`の前段で、`finding_type`にIAMユーザーやアクセスキーに関連する文字列が含まれているかをチェックしている。それ以外のFindingタイプは`action_taken: "none"`のまま安全に素通りする(この設計が、後述のサンプルFinding大量生成のときに効いてくる)。
 
+:::details コードの詳細解説
+
+**1. 環境変数の読み込み (`os.environ`)**
+
+通知先のSNSトピックARNと、封じ込め対象のアカウントIDを環境変数から受け取っている。コード自体を書き換えずに宛先を変更できるので、検証環境と本番環境で同じzipを使い回せる。逆に、ロール名(`SecurityOpsContainmentRole`)とExternalIdはコードに直書きしている。ここは環境ごとに変える想定がなく、外から差し替えられると封じ込め先を付け替えられることになるため、あえて固定した。
+
+**2. 事件データの解析 (`event["detail"]`)**
+
+GuardDutyがEventBridge経由で渡してくるFindingのJSONから、Findingタイプ・重大度・タイトル・発生元アカウントIDを取り出している。封じ込めに必要なアクセスキーIDとユーザー名は、さらに深い`detail.resource.accessKeyDetails`の下にある。
+
+この構造に依存している点は弱点でもある。`accessKeyDetails`はアクセスキー由来のFindingにしか存在しないため、他のタイプのFindingが来たときに同じ場所を読もうとすると`KeyError`になる。今回は`finding_type`による分岐で先に絞ることで回避している。
+
+**3. クロスアカウントの突破 (`STS.assume_role`)**
+
+Account BのLambdaが、Account Cの`SecurityOpsContainmentRole`をExternalId付きで引き受け、一時認証情報を受け取る部分。ここがこの構成の核心にあたる。
+
+受け取った一時認証情報で新しい`boto3.client("iam")`を作り直しているのがポイントで、以降のIAM操作はすべてAccount C側のコンテキストで実行される。モジュール先頭で作った`STS`・`SNS`のクライアントはAccount B側のままなので、SNSへの通知はAccount B側のトピックに飛ぶ。同じ関数の中で2つのアカウントを跨いでいることになる。
+
+**4. 封じ込めの実行 (`update_access_key`)**
+
+アクセスキーのステータスを`Inactive`に変更する。削除(`delete-access-key`)ではなく無効化を選んでいるのは、後から`Active`に戻せる可逆的な操作だからだ。自動実行される処理で不可逆な操作を選ぶと、誤検知が起きたときに復旧できなくなる。
+
+手動対応であれば、メールに気づく、PCを開く、コンソールにログインする、対象ユーザーを探す、という手順を踏む間に時間が経つ。ここを自動化しておけば、検知からキー無効化までが人の介在なしに完了する。ただし今回の検証では、GuardDutyのサンプルFinding経由でこの部分まで通すことはできていない(理由はPart 6に書く)。
+
+:::
+
 ### Lambda関数を作成する
 
 ```bash
@@ -614,7 +652,7 @@ aws lambda get-function --function-name guardduty-containment --query "Configura
 
 ### イベントパターン
 
-重大度(severity)でフィルタする。
+重大度(severity)でフィルタする。すべてのFindingでLambdaを起動すると、低・中重大度の検出でも封じ込めが走ってしまう。人の確認を挟まずに動く処理である以上、自動で対応してよい範囲を先に絞っておく必要がある。ここでは`severity >= 7`(High以上)だけを通し、それ未満は人間の判断に回す前提にした。
 
 ```json
 {
@@ -785,6 +823,20 @@ aws iam list-access-keys --user-name test-containment-target
 
 要件2(自動封じ込め)を、GuardDutyのダミーデータの制約を切り分けた上で、最終的に実機で確認できた。
 
+### 通しテストで確認できた連鎖
+
+どこまでが自動で流れ、どこから手を入れたのかを整理しておく。
+
+1. **GuardDutyがAccount Cの脅威を検知する** — サンプルFindingで確認
+2. **EventBridgeが`severity >= 7`だけを拾い、Account BのLambdaを自動起動する** — CloudWatch Logsに複数回の起動を確認
+3. **LambdaがExternalIdを添えてAccount Cの`SecurityOpsContainmentRole`をAssumeRoleする** — ログ上で成功を確認
+4. **対象ユーザーのアクセスキーを`Inactive`にする** — サンプルFinding経由では実行されなかった。ダミーのユーザー名が最小権限ポリシーに拒否されたため。実在するアクセスキーIDを含むテストイベントでLambdaを直接起動して、`Inactive`への変更を確認した
+5. **SNS経由で管理者に通知する** — サンプルFinding生成時に、条件を満たしたFinding数と同数のメールを受信
+
+1から3まではサンプルFindingだけで通しで流れた。4だけは、サンプルFindingのダミーデータと最小権限ポリシーの組み合わせでは検証できないため、切り分けて別に確認している。5はサンプルFinding経由で確認できた。
+
+なお、4を「サンプルFindingで通らないから権限を緩める」方向で解決するのは筋が悪い。緩めれば通るが、それは封じ込めの対象範囲を広げるということで、検証のために本番の安全性を下げることになる。対象を絞ったまま、テストデータの側を実データに寄せるほうが正しい。
+
 ---
 
 ## 検証結果まとめ
@@ -806,37 +858,7 @@ GuardDutyは新規アカウントの30日間無料トライアル対象、EventB
 
 ここまでで作ったものを、アカウントとロールの対応関係として1枚にまとめておく。次のPart 7で削除するのは、この図に出てくるリソースがすべてになる。
 
-```
-[C] GuardDuty (メンバー) ─── 不審な API 呼び出し・通信を検知
-      │
-      │ 委任管理者機能により自動集約(ログ転送の設定は不要)
-      ↓
-[B] GuardDuty (委任管理者) ─── C の Finding を集約して保持
-      │
-      ↓
-[B] EventBridge  guardduty-high-severity-rule
-      │          severity >= 7 のみ通過
-      │ invoke
-      ↓
-[B] Lambda  guardduty-containment
-      │     実行ロール: GuardDutyContainmentLambdaRole
-      │     (信頼: lambda.amazonaws.com)
-      │
-      ├─ sns:Publish ─→ [B] SNS  guardduty-high-severity-alerts
-      │
-      │ sts:AssumeRole (+ ExternalId)
-      ↓
-[C] IAMロール  SecurityOpsContainmentRole
-      │        信頼: B の GuardDutyContainmentLambdaRole + ExternalId
-      │ iam:UpdateAccessKey (Resource は下の1ユーザーのみ)
-      ↓
-[C] IAMユーザー  test-containment-target ─── アクセスキーを Inactive に
-
-[A] Organizations  委任管理者の登録操作にのみ関与
-                   GuardDuty には参加せず、上の経路上にいない
-```
-
-`[A]` `[B]` `[C]` はそのリソースが存在するアカウントを表す。
+![完成時点のアカウントとロールの関係図](/images/arch-01-final-architecture.png)
 
 この図で確認しておきたいのは次の3点。
 
@@ -946,10 +968,24 @@ Account B・Cのアカウント自体(器)をクローズするかどうかは�
 実際に手を動かしてみて、ドキュメントを読むだけでは分からなかったことがいくつもあった。
 
 1. **委任管理者登録・メンバー追加の操作だけで、GuardDutyが自動有効化される**。手動での`create-detector`は不要
-2. **IAMロールの信頼関係には作成順序の依存がある**。信頼される側を先に作る必要がある
+2. **IAMロールの信頼関係には作成順序の依存がある**。信頼される側を先に作る必要がある。権限ポリシーの`Resource`は実在チェックされないのに、信頼ポリシーの`Principal`はチェックされる、という非対称性が理由だった
 3. **メンバーアカウント同士は直接AssumeRoleできない**。必ず管理アカウントを経由する
 4. **CLIでEventBridge→Lambda連携を組む場合、`lambda add-permission`を自分で叩く必要がある**。コンソール操作と違って自動付与されない
 5. **サンプルFinding機能は全種類を一括生成し、ダミーのリソース識別子を含む**。検知パイプラインの確認には使えるが、実際の封じ込めアクションの検証には向いていない
 6. **最小権限ポリシーは、意図しない対象への操作を「正しく」拒否してくれる**。今回のダミーユーザーへの操作拒否は、まさにこの設計が効いた場面だった
 
 いずれも、設計編で立てた構成そのものを覆すものではなかったが、実装の細部では想定と異なる挙動がいくつもあり、実機検証の価値を改めて感じた。
+
+## 次にやること: コード化
+
+今回はすべてCLIで手作業で組んだ。おかげで、どのコマンドが何を返すか、どこで順序の制約に当たるかを一つずつ確認できた。手順・JSON・Pythonコードは確定したので、素材としては揃っている。
+
+一方で、手作業のままでは割に合わない部分もはっきりした。
+
+- Account B → Account C → Account Bと認証情報を行き来する手間が、そのまま作業ミスの温床になる
+- 信頼ポリシーと権限ポリシーの作成順序を、人間が毎回計算している
+- 後片付け(Part 7)で消し忘れると、リソースが孤立して残る
+
+いずれもTerraformのようなIaCツールで解消できる範囲にある。リソース間の参照関係から依存グラフが作られるので、順序は自動で解決される。作成と削除が同じ定義から実行できるので、消し忘れも起きにくい。同じ構成を別リージョン・別アカウントで再現するときの再現性も上がる。
+
+検証環境を何度も作り直す前提であれば、手で組むのは最初の1回だけで十分だと思う。次はこの構成をコードに落とすところをやる。
