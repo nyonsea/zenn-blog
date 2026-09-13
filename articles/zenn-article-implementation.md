@@ -1,5 +1,5 @@
 ---
-title: "GuardDuty × EventBridge × Lambdaで組む、Organizationsクロスアカウント自動封じ込め ― 構築・検証編"
+title: "GuardDuty×EventBridge×Lambdaで組む、Organizationsクロスアカウント自動封じ込め ― 構築・検証編"
 emoji: "🔧"
 type: "tech"
 topics: ["aws", "security", "guardduty", "lambda", "eventbridge"]
