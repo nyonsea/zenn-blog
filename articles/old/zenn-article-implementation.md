@@ -8,7 +8,14 @@ published: false
 
 ## この記事について
 
-[設計編](#)で組んだ構成を、実際にCLIで一から構築し、検証した記録。設計判断や本番運用時の考察は設計編にまとめてあるので、この記事は「実際に何を打って、何が起きたか」を、手順として再現できる粒度で書く。
+[設計編](https://zenn.dev/nyondev/articles/<設計編のslug>)で組んだ構成を、実際にCLIで一から構築し、検証した記録。設計判断や本番運用時の考察は設計編にまとめてあるので、この記事は「実際に何を打って、何が起きたか」を、手順として再現できる粒度で書く。
+
+設計編で立てた要件は次の4つ。この記事では、それぞれを実機で確認できたかどうかまで追う。
+
+1. **検知**: 本番役アカウントで発生した脅威をGuardDutyが検出する
+2. **自動封じ込め**: 重大度の高い検出結果に対し、人手を介さず侵害された認証情報を無効化する
+3. **通知**: 封じ込めの実行有無を管理者へ通知する
+4. **集約**: すべての検出結果をセキュリティ運用アカウントに集める
 
 この記事は、次のような人を読者として想定している。
 
@@ -54,9 +61,9 @@ published: false
 
 作業を始める前に、Account AでOrganizationsコンソールを開き、現在の組織構造を確認しておく。
 
-この画面で、既存のメンバーアカウント・OU構成を把握してから進める。今回は新たにAccount B・Cを作成するところから始める。
-
 ![Organizationsコンソールで組織構造を確認。管理アカウントとメンバーアカウントの一覧が見える](/images/organizations-console-overview0.png)
+
+この画面で、既存のメンバーアカウント・OU構成を把握してから進める。今回は新たにAccount B・Cを作成するところから始める。
 
 ### Account B・Cの新規作成
 
@@ -72,7 +79,6 @@ aws organizations create-account \
   --email "<your-address>+prodsim@gmail.com" \
   --account-name "prod-sim-account"
 ```
-
 
 ![Organizationsコンソールで組織構造を確認。管理アカウントとメンバーアカウントの一覧が見える](/images/organizations-console-overview.png)
 
@@ -234,7 +240,18 @@ aws guardduty list-detectors
 
 ![Account C側でも検出器IDが自動的に返ってくる](/images/part1-04-account-c-detector-confirmed.png)
 
-メンバーとして追加された時点で、Account C側もGuardDutyが自動有効化される。こちらも手動での`create-detector`は不要だった。
+メンバーとして追加された時点で、Account C側もGuardDutyが自動有効化される。こちらも手動での`create-detector`は不要だった。招待(`invite-members`)と承諾(`accept-invitation`)のやり取りが要らないのは、Organizations配下のアカウントだからで、組織外のアカウントをメンバーにする場合はこの招待フローが必要になる。
+
+なお今回はアカウントを明示して`create-members`で登録したが、組織に新しいアカウントが追加されるたびに自動でメンバー化する設定もある。
+
+```bash
+# Account B(委任管理者)の認証情報で実行
+aws guardduty update-organization-configuration \
+  --detector-id <Account_Bの検出器ID> \
+  --auto-enable-organization-members ALL
+```
+
+アカウントが増え続ける本番組織ではこちらが実用的で、「新規アカウントだけGuardDutyが入っていない」という穴を構造的に塞げる。今回は挙動を1つずつ確認したかったので手動登録にした。旧来の`--auto-enable`オプションは非推奨になっているため、こちらを使う。
 
 ### 集約を実機で確認する(要件4)
 
@@ -317,6 +334,16 @@ aws iam create-role \
 
 3は`Resource`が実在チェックされないため、1と2の間に入れても通る。今回は実際に1 → 3 → 2の順で実行した。順序を気にせず進めたいなら1 → 2 → 3が安全側になる。いずれにせよ、絶対に入れ替えられないのは1と2の関係で、ここだけは崩せない。
 
+### なぜ実在チェックが必要なのか、そして運用中に効いてくる副作用
+
+実在チェックが入る理由は、IAMが信頼ポリシーの`Principal`を保存する際、**書いたARNをそのまま持つのではなく、ロール固有のユニークID(`AROA`で始まる文字列)に内部変換している**ため。変換先が存在しなければ変換できないので、その場で弾かれる。
+
+この仕様には、構築時よりも運用時に効いてくる副作用がある。**Account B側のロールを削除して、同じ名前で作り直すと、Account C側の信頼ポリシーは壊れる**。名前は同じでもユニークIDが変わるため、変換済みのIDと一致しなくなる。このときコンソールの信頼関係タブには、ARNではなく生の`AROA...`が表示される。これが出ていたら「参照先のロールが作り直されている」というサインになる。
+
+障害対応でロールを作り直したあと、クロスアカウントの連携だけが無言で止まる、という事故の原因になりうる。ロール名を再利用する前提の運用は避けた方がよい。
+
+回避策として、`Principal`をロールARNではなく`arn:aws:iam::222222222222:root`(アカウント単位)にする方法もある。この場合は実在チェックが走らず、作成順序の制約もなくなり、ロールを作り直しても壊れない。ただし「Account Bの誰か」まで許可範囲が広がり、実際に誰が入れるかはAccount B側のIAM権限だけで決まることになる。**許可の判断がC側からB側に移る**ということなので、今回は採用しなかった。封じ込め対象のアカウント側で「入ってこられる相手」を明示的に握っておきたかったため。
+
 なお、Terraformのようなツールでコード化する場合、この依存関係は参照関係から自動的に解決されるので、人間が順番を計算する必要はなくなる。
 
 ### 正しい順序: まずAccount B側にLambda実行ロールを作る
@@ -385,7 +412,9 @@ aws iam put-role-policy \
 
 ![GuardDutyContainmentLambdaRoleのロール概要(コンソール)](/images/part3-05-lambda-role-overview-gui.png)
 
-「リソースの概要」タブでは、まだLambdaが一度も実行されていない段階ではCloudWatch Logsの権限しか表示されないことがある。これはコンソールのUIがCloudTrailの実行履歴を元に表示を補強しているためで、`sts:AssumeRole`や`sns:Publish`の権限自体は正しく設定されている(付与したポリシーのJSON自体は「許可」タブでいつでも確認できる)。
+「リソースの概要」タブを開いたところ、付与したはずの`sts:AssumeRole`・`sns:Publish`が見当たらず、CloudWatch Logsの権限しか表示されていなかった。ポリシーのJSON自体は「許可」タブで確認でき、3つのステートメントは正しく入っていたので、表示側の問題と判断して先に進めた(この時点で原因は特定していない)。
+
+いずれにせよ、IAMの設定確認をコンソールの要約ビューだけで済ませるのは危ういというのが実感で、**権限の確認は最終的にJSONそのものを見る**のが確実だと思う。
 
 ![リソースの概要タブ。実行前はCloudWatch Logsの権限しか表示されないことがある](/images/part3-04-lambda-role-resource-overview-gui.png)
 
@@ -411,7 +440,15 @@ Account BのLambda実行ロールが存在する状態になったので、Accou
 }
 ```
 
-`sts:ExternalId`は、Principalが正しくても合言葉を一緒に提示しないとAssumeRoleを許可しない、という追加の防御。今回は同じ所有者が管理する2アカウント間なので必須ではないが、将来的に外部のセキュリティベンダーに監視・対応を委託するような構成に発展した場合、この合言葉がないと「別の顧客のふりをして誤って侵入する」という事故(confused deputy問題)を防げない。今のうちから習慣化しておく意図で組み込んだ。
+`sts:ExternalId`は、Principalが正しくても、決められた文字列を一緒に提示しないとAssumeRoleを許可しない、という追加の条件。
+
+これが本来効くのは、複数の顧客のアカウントに入っていく外部ベンダーのような構成だ。ベンダーは自分の1つのロールから、顧客A・顧客B双方のロールをAssumeRoleできる。ここで顧客AがどこかでBのロールARNを知ってしまうと、「このARNを引き受けてくれ」とベンダーに頼むことで、ベンダーの権限を使ってBのアカウントを操作させられてしまう。ベンダー自身に悪意はなく、**言われた通りに代理実行しただけで加害者になる**。これがconfused deputy問題で、ExternalIdはこれを防ぐためのもの。B側が「自分だけに割り当てられたIDを添えたときしか許可しない」と宣言しておけば、AはBのIDを知らないので成立しない。
+
+注意点として、**ExternalIdは秘密情報ではない**。AWSのドキュメントでもパスワードのように扱うものではないと明示されている。役割は「相手ごとにユニークな識別子であること」であって、漏れたら危険な値ではない。この記事で値をそのまま掲載し、Lambdaのコードに直書きしているのもそのためだ。逆に言えば、ExternalIdだけで守られている構成は成立しない。実効的な防御はあくまで信頼ポリシーの`Principal`と、Account B側のIAM権限の方にある。
+
+今回は同じ所有者が管理する2アカウント間なので必須ではないが、外部委託構成へ発展させる余地を残す意味で、最初から組み込んでおいた。
+
+参考: [How to use an external ID when granting access to your AWS resources to a third party](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-user_externalid.html)
 
 **`account-c-permission-policy.json`**(最小権限。テスト用ユーザー1人に限定):
 ```json
@@ -428,7 +465,9 @@ Account BのLambda実行ロールが存在する状態になったので、Accou
 }
 ```
 
-Resourceをワイルドカード(`user/*`)にせず特定の1ユーザーに絞ったのは、自動封じ込めが誤作動した場合の影響範囲(ブラストラディウス)を最小化するため。この判断は後述するPart 5で、実際に効果を発揮することになる。
+Resourceをワイルドカード(`user/*`)にせず特定の1ユーザーに絞ったのは、自動封じ込めが誤作動した場合の影響範囲を最小化するため。この判断は後述するPart 6で、想定と違う形で効果を発揮することになる。
+
+一点、後から見て余分だったのが`iam:ListAccessKeys`で、**Lambdaのコードからは一度も呼んでいない**。「キー一覧を取ってから止める」実装も考えたが、最終的にFindingに含まれるアクセスキーIDを直接使う形にしたため、不要になったまま残っていた。最小権限を主題にしておきながら使わない権限を残しているのは筋が通らないので、本来は外すべきだった。使う予定で付けた権限が、実装方針の変更後も残り続ける、というのは実運用でもよくある権限肥大のパターンだと思う。
 
 ```bash
 # Account Cの認証情報で実行
@@ -501,7 +540,9 @@ aws sns subscribe \
 
 ![subscribeが成功し、SubscriptionArnがpending confirmationで返ってきた様子](/images/part5-06-sns-subscribe-success.png)
 
-`"SubscriptionArn": "pending confirmation"`はエラーではなく、メール確認待ちの正常な状態。届いた確認メールの「Confirm subscription」リンクをクリックすると購読が有効になる。ここだけはAWSにAPIが存在しないため、唯一の手作業になる。
+`"SubscriptionArn": "pending confirmation"`はエラーではなく、メール確認待ちの正常な状態。届いた確認メールの「Confirm subscription」リンクをクリックすると購読が有効になる。
+
+確認操作自体には`sns confirm-subscription`というAPIが存在する。ただし引数に必要な確認トークンは、emailプロトコルの場合メール本文のリンクにしか含まれない。つまり「APIがない」のではなく、**トークンを受け取る手段がメールしかない**ために、CLIだけでは完結しない。HTTPSエンドポイントを使う構成であれば、受け取ったトークンをそのまま`confirm-subscription`に渡して自動化できる。
 
 ![Subscription confirmedのWebページが表示された様子](/images/part5-07-sns-subscription-confirmed-page.png)
 
@@ -588,31 +629,117 @@ def lambda_handler(event, context):
     return {"statusCode": 200, "body": json.dumps(message, ensure_ascii=False)}
 ```
 
-`iam_c.update_access_key`の前段で、`finding_type`にIAMユーザーやアクセスキーに関連する文字列が含まれているかをチェックしている。それ以外のFindingタイプは`action_taken: "none"`のまま安全に素通りする(この設計が、後述のサンプルFinding大量生成のときに効いてくる)。
+`iam_c.update_access_key`の前段で、Findingタイプを見て封じ込め対象かどうかを絞っている。条件に合わないFindingは`action_taken: "none"`のまま素通りする(この分岐がないと、後述のサンプルFinding大量生成で全滅していた)。
+
+なお、この分岐条件は検証後に見直しが必要だと分かった。詳細は後述の「この実装の問題点」にまとめてある。
 
 :::details コードの詳細解説
 
-**1. 環境変数の読み込み (`os.environ`)**
+処理を5つのフェーズに分けて見ていく。
 
-通知先のSNSトピックARNと、封じ込め対象のアカウントIDを環境変数から受け取っている。コード自体を書き換えずに宛先を変更できるので、検証環境と本番環境で同じzipを使い回せる。逆に、ロール名(`SecurityOpsContainmentRole`)とExternalIdはコードに直書きしている。ここは環境ごとに変える想定がなく、外から差し替えられると封じ込め先を付け替えられることになるため、あえて固定した。
+**1. 準備: クライアントと設定値**
 
-**2. 事件データの解析 (`event["detail"]`)**
+```python
+STS = boto3.client("sts")
+SNS = boto3.client("sns")
 
-GuardDutyがEventBridge経由で渡してくるFindingのJSONから、Findingタイプ・重大度・タイトル・発生元アカウントIDを取り出している。封じ込めに必要なアクセスキーIDとユーザー名は、さらに深い`detail.resource.accessKeyDetails`の下にある。
+TARGET_ACCOUNT_ID = os.environ["TARGET_ACCOUNT_ID"]  # Account CのID
+CONTAINMENT_ROLE_NAME = "SecurityOpsContainmentRole"
+EXTERNAL_ID = "guardduty-containment-verify"
+SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+```
 
-この構造に依存している点は弱点でもある。`accessKeyDetails`はアクセスキー由来のFindingにしか存在しないため、他のタイプのFindingが来たときに同じ場所を読もうとすると`KeyError`になる。今回は`finding_type`による分岐で先に絞ることで回避している。
+モジュールの先頭で作るクライアントは2つ。認証情報を切り替えるためのSTSと、通知を送るためのSNS。どちらもこの時点ではAccount B側のコンテキストで動く。
 
-**3. クロスアカウントの突破 (`STS.assume_role`)**
+設定値の扱いは意図的に分けている。Account CのアカウントIDとSNSトピックのARNは環境変数から読む。コードを書き換えずに宛先を差し替えられるので、同じzipを別環境でも使い回せる。一方、封じ込め先のロール名とExternalIdはコードに直書きにした。環境ごとに変える想定がないうえ、外から差し替えられるということは封じ込め先を付け替えられるということでもあるためだ。
 
-Account BのLambdaが、Account Cの`SecurityOpsContainmentRole`をExternalId付きで引き受け、一時認証情報を受け取る部分。ここがこの構成の核心にあたる。
+**2. 受付: Findingの解析**
 
-受け取った一時認証情報で新しい`boto3.client("iam")`を作り直しているのがポイントで、以降のIAM操作はすべてAccount C側のコンテキストで実行される。モジュール先頭で作った`STS`・`SNS`のクライアントはAccount B側のままなので、SNSへの通知はAccount B側のトピックに飛ぶ。同じ関数の中で2つのアカウントを跨いでいることになる。
+```python
+def lambda_handler(event, context):
+    detail = event["detail"]
+    finding_type = detail["type"]
+    severity = detail["severity"]
+    title = detail.get("title", "")
+    account_id = detail["accountId"]
+```
 
-**4. 封じ込めの実行 (`update_access_key`)**
+`event`には、EventBridge経由でGuardDutyのFindingがそのまま入ってくる。必要な情報は`detail`の下にあり、ここではFindingタイプ、重大度、タイトル、発生元のアカウントIDを取り出している。
 
-アクセスキーのステータスを`Inactive`に変更する。削除(`delete-access-key`)ではなく無効化を選んでいるのは、後から`Active`に戻せる可逆的な操作だからだ。自動実行される処理で不可逆な操作を選ぶと、誤検知が起きたときに復旧できなくなる。
+`title`だけ`get()`でデフォルト値を用意しているのは、Findingタイプによって存在しない場合があるため。他の4つは必須フィールドとして直接参照している。
 
-手動対応であれば、メールに気づく、PCを開く、コンソールにログインする、対象ユーザーを探す、という手順を踏む間に時間が経つ。ここを自動化しておけば、検知からキー無効化までが人の介在なしに完了する。ただし今回の検証では、GuardDutyのサンプルFinding経由でこの部分まで通すことはできていない(理由はPart 6に書く)。
+**3. 越境: Account CへのAssumeRole**
+
+```python
+    assumed = STS.assume_role(
+        RoleArn=f"arn:aws:iam::{TARGET_ACCOUNT_ID}:role/{CONTAINMENT_ROLE_NAME}",
+        RoleSessionName="guardduty-containment",
+        ExternalId=EXTERNAL_ID,
+    )
+    creds = assumed["Credentials"]
+    iam_c = boto3.client(
+        "iam",
+        aws_access_key_id=creds["AccessKeyId"],
+        aws_secret_access_key=creds["SecretAccessKey"],
+        aws_session_token=creds["SessionToken"],
+    )
+```
+
+この構成の核心にあたる部分。
+
+`assume_role`にExternalIdを添えて呼ぶと、Account C側の信頼ポリシーに書いた`Condition`と突き合わされ、一致したときだけ有効期限付きの一時認証情報が返る。Part 2で組んだ2段階の信頼構造が実際に効くのがここになる。
+
+返ってきた`creds`で`boto3.client("iam")`を作り直している点が重要で、これ以降`iam_c`を使った操作はすべてAccount C側で実行される。一方、先頭で作った`STS`と`SNS`はAccount B側のままなので、フェーズ5の通知はAccount B側のトピックに飛ぶ。1つの関数の中で2つのアカウントのコンテキストが同時に生きていることになる。
+
+`RoleSessionName`はAccount C側のCloudTrailに記録される。後からログを追うときに、この操作がどこから来たのかを名前で判別できるので、意味の分かる名前を付けておく。
+
+**4. 封じ込め: アクセスキーの無効化**
+
+```python
+    action_taken = "none"
+    if "UnauthorizedAccess:IAMUser" in finding_type or "AccessKey" in finding_type:
+        access_key_id = detail["resource"]["accessKeyDetails"]["accessKeyId"]
+        user_name = detail["resource"]["accessKeyDetails"]["userName"]
+        iam_c.update_access_key(
+            AccessKeyId=access_key_id,
+            Status="Inactive",
+            UserName=user_name,
+        )
+        action_taken = f"disabled access key {access_key_id} for user {user_name}"
+```
+
+`finding_type`で先に絞り込んでから、`detail.resource.accessKeyDetails`の下にあるアクセスキーIDとユーザー名を取り出す。
+
+この分岐は「対象を選ぶ」以上の意味がある。`accessKeyDetails`はアクセスキー由来のFindingにしか存在しないため、絞らずに読みにいくと、他のタイプのFindingが届いた時点で`KeyError`になる。条件に合わないFindingは`action_taken`が`"none"`のまま通知だけが飛ぶ。
+
+ただし、この条件式の書き方自体には問題がある。`"AccessKey" in finding_type`の方は**一度も成立しない**。`AccessKey`という文字列が現れるのは`resource.resourceType`の値であって、`detail.type`(Findingタイプ名)ではないためだ。実際に動いていたのは`"UnauthorizedAccess:IAMUser" in finding_type`だけで、こちらはこちらで対象が狭すぎる。修正案は後述の「この実装の問題点」に書いた。
+
+`update_access_key`で`Status="Inactive"`に変更するのがこの関数の本題にあたる。削除(`delete-access-key`)ではなく無効化を選んだのは、後から`Active`に戻せる可逆的な操作だからだ。人の確認を挟まずに動く処理で不可逆な操作を選ぶと、誤検知が起きたときに元に戻せなくなる。
+
+**5. 報告: SNSへの通知**
+
+```python
+    message = {
+        "findingType": finding_type,
+        "severity": severity,
+        "title": title,
+        "sourceAccount": account_id,
+        "actionTaken": action_taken,
+    }
+    SNS.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=f"[GuardDuty] {finding_type} (severity={severity})",
+        Message=json.dumps(message, ensure_ascii=False, indent=2),
+    )
+```
+
+どのアカウントで何が起き、この関数が何をしたのかをJSONにまとめてSNSに送る。`actionTaken`を必ず含めているので、封じ込めが実行されたのか、条件に合わず素通りしたのかを、受け取った側が本文だけで判断できる。
+
+`publish`は`if`ブロックの外側にあるため、条件に合わず封じ込めを行わなかったFindingでも通知は届く。自動処理が「何もしなかった」ことを人間が把握できるようにするためで、黙って素通りさせない方がよい。
+
+ただしこれは「条件に合わなかった」場合の話でしかない。`update_access_key`が例外を投げた場合、処理は`publish`に到達せずに関数ごと終了する。**封じ込めに失敗したときだけ通知が飛ばない**という構造になっていて、これは後述の検証で実際に踏むことになった。
+
+Subjectに`finding_type`と`severity`を入れているのは、メールの一覧画面で開かずに優先度を判断できるようにするため。SNSトピックの先をSlack連携(AWS Chatbot)に差し替えれば、同じ内容をチャンネルに流すこともできる。
 
 :::
 
@@ -649,6 +776,17 @@ aws lambda get-function --function-name guardduty-containment --query "Configura
 ## Part 5: EventBridgeルールを作る
 
 委任管理者アカウント(Account B)のデフォルトイベントバスには、メンバーアカウント(Account C)分も含めてGuardDutyのFindingイベントが自動的に集約される。**クロスアカウントのイベントバス許可設定は不要**というのがGuardDutyのマルチアカウント連携の便利な点だった。
+
+### 配信タイミングを先に押さえておく
+
+EventBridgeを挟む以上、「検知した瞬間に封じ込めが走る」わけではない。GuardDutyからEventBridgeへの配信には2つの経路がある。
+
+- **新規Finding**(固有のFinding IDを持つもの): ニアリアルタイムで配信される。この頻度は変更できない。実運用上は数分程度を見込む
+- **既存Findingの再発**: 既定で6時間分がまとめて1イベントに集約される。この頻度(15分/1時間/6時間)を変更できるのは委任管理者アカウントだけで、メンバーアカウント側からは変更できない
+
+つまり、同じ攻撃者が同じ手口を繰り返している場合、2回目以降の検出は既定では最大6時間遅れて届く。「自動化したのに対応が遅い」の典型的な原因がここにある。実運用で自動封じ込めを前提にするなら、`update-detector --finding-publishing-frequency FIFTEEN_MINUTES`を委任管理者側で設定しておく必要がある(今回は既定のまま検証した)。
+
+参考: [Processing GuardDuty findings with Amazon EventBridge](https://docs.aws.amazon.com/guardduty/latest/ug/guardduty_findings_eventbridge.html)
 
 ### イベントパターン
 
@@ -759,9 +897,25 @@ is not authorized to perform: iam:UpdateAccessKey on resource: user GeneratedFin
 aws iam list-access-keys --user-name test-containment-target
 ```
 
-一瞬「Lambdaにバグがあるのでは」と焦ったが、原因を調べると、GuardDutyのサンプルFindingが`accessKeyDetails.userName`に**実在しないダミー値**(`GeneratedFindingUserName`)を入れる仕様だったことが分かった。Part 2で書いた通り、封じ込め用のIAM権限は特定の1ユーザー(`test-containment-target`)だけに絞っていたため、このダミーユーザーへの操作は最小権限ポリシーによって正しく拒否された。**バグではなく、最小権限が意図通り機能した結果**だった。
+一瞬「Lambdaにバグがあるのでは」と焦ったが、原因を調べると、GuardDutyのサンプルFindingが`accessKeyDetails.userName`に**実在しないダミー値**(`GeneratedFindingUserName`)を入れる仕様だったことが分かった。サンプルFindingはプレースホルダー値で埋められた近似データなので、リソース識別子は実在しない。Part 2で書いた通り、封じ込め用のIAM権限は特定の1ユーザー(`test-containment-target`)だけに絞っていたため、このダミーユーザーへの操作は最小権限ポリシーによって正しく拒否された。**バグではなく、最小権限が意図通り機能した結果**だった。
 
 言い換えると、GuardDutyのサンプルFinding機能は「検知〜通知までのパイプラインの配線確認」には使えるが、「実リソースに対する封じ込めアクションそのものの検証」には向いていない。
+
+### ここで気づいた、通知の設計ミス
+
+エラーの内容よりも気になったのは、**このAccessDeniedがメールで通知されなかった**ことだ。CloudWatch Logsを見に行くまで、封じ込めが失敗していたことに気づけなかった。
+
+コードを見返すと理由は明快で、`SNS.publish`が`update_access_key`より後ろにあり、例外処理を入れていない。`update_access_key`が例外を投げた時点で関数は終了し、通知処理には到達しない。つまり、
+
+- 封じ込めの対象外だったFinding → 通知が届く
+- 封じ込めに成功したFinding → 通知が届く
+- **封じ込めに失敗したFinding → 通知が届かない**
+
+という、優先順位が完全に逆の挙動になっていた。自動対応において人間が最も早く知るべきなのは失敗の方で、「アラートは上がったが対処は失敗しており、そのことに誰も気づいていない」は運用として最悪の状態になる。
+
+さらに、EventBridgeからLambdaへの呼び出しは非同期のため、例外で終了した場合は既定で2回リトライされ、それでも失敗すれば破棄される。デッドレターキュー(DLQ)を設定していなかったので、失敗したイベント自体もどこにも残らなかった。手元に残っていたのはCloudWatch Logsだけで、これは「たまたま見に行ったから分かった」に過ぎない。
+
+修正案はこのあとの「この実装の問題点」にまとめた。
 
 ### 封じ込めロジック単体を検証する
 
@@ -785,6 +939,8 @@ aws iam list-access-keys --user-name test-containment-target
 }
 '@ | Out-File -FilePath manual-invoke-containment-test-event.json -Encoding utf8
 ```
+
+**再現時の注意**: Windows PowerShell 5.1の`-Encoding utf8`は**BOM付き**で書き出す。BOMが付いたJSONはAWS CLIのパースに失敗することがあるので、その場合はPowerShell 7の`-Encoding utf8NoBOM`か、`[System.IO.File]::WriteAllText()`でBOMなしにする。
 
 ```bash
 # Account Bの認証情報で実行
@@ -831,11 +987,388 @@ aws iam list-access-keys --user-name test-containment-target
 2. **EventBridgeが`severity >= 7`だけを拾い、Account BのLambdaを自動起動する** — CloudWatch Logsに複数回の起動を確認
 3. **LambdaがExternalIdを添えてAccount Cの`SecurityOpsContainmentRole`をAssumeRoleする** — ログ上で成功を確認
 4. **対象ユーザーのアクセスキーを`Inactive`にする** — サンプルFinding経由では実行されなかった。ダミーのユーザー名が最小権限ポリシーに拒否されたため。実在するアクセスキーIDを含むテストイベントでLambdaを直接起動して、`Inactive`への変更を確認した
-5. **SNS経由で管理者に通知する** — サンプルFinding生成時に、条件を満たしたFinding数と同数のメールを受信
+5. **SNS経由で管理者に通知する** — メールを受信。ただし届いたのは「封じ込め対象外」として素通りしたFindingの分だけで、`update_access_key`で例外終了したIAMユーザー系Findingの分は届かなかった(前述の通知の設計ミス)
 
-1から3まではサンプルFindingだけで通しで流れた。4だけは、サンプルFindingのダミーデータと最小権限ポリシーの組み合わせでは検証できないため、切り分けて別に確認している。5はサンプルFinding経由で確認できた。
+1から3まではサンプルFindingだけで通しで流れた。4だけは、サンプルFindingのダミーデータと最小権限ポリシーの組み合わせでは検証できないため、切り分けて別に確認している。5は通知経路そのものは機能したが、失敗時に通知されないという欠陥が同時に見つかった。
 
-なお、4を「サンプルFindingで通らないから権限を緩める」方向で解決するのは筋が悪い。緩めれば通るが、それは封じ込めの対象範囲を広げるということで、検証のために本番の安全性を下げることになる。対象を絞ったまま、テストデータの側を実データに寄せるほうが正しい。
+なお、4を「サンプルFindingで通らないから権限を緩める」方向で解決しようとしても、そもそも解決しない。`Resource`を`user/*`に広げれば`AccessDenied`は消えるが、`GeneratedFindingUserName`というユーザー自体がAccount Cに存在しないため、今度は`NoSuchEntity`で落ちるだけになる。
+
+つまりこれは**権限の問題に見えて、実際にはテストデータの問題**だった。権限を緩めれば封じ込めの対象範囲が広がり、検証のために本番の安全性を下げることになるうえ、それで検証が進むわけでもない。対象を絞ったまま、テストデータの側を実データに寄せるのが正しい方向になる。
+
+---
+
+## Part 6.5: CloudTrailに何が残ったか
+
+Part 6ではCloudWatch Logsを見て切り分けたが、それはあくまでAccount B側、つまり自分で作ったアプリケーションのログになる。侵害対応の観点では、**封じ込めを受けた側(Account C)に残った証跡だけで、誰が・どこから・何をしたかを再構成できるか**の方が重要になる。実インシデントでは、侵害されたアカウント側のログしか手元にないことも珍しくない。
+
+この節は、検証から約1か月後、Part 7の後片付けでリソースを全削除したあとに引いている。リソースを消してもCloudTrailの記録は消えない。証跡(Trail)を作成していなくても、イベント履歴は管理イベントを90日間保持する。今回必要な`AssumeRole`と`UpdateAccessKey`はどちらも管理イベントなので、追加設定なしで残っていた。
+
+### まず引っかかった点: 同じ1回の封じ込めで、記録先リージョンが分かれる
+
+作業リージョンである`ap-northeast-1`で`UpdateAccessKey`を探しても、何も出てこない。IAMはグローバルサービスで、**その証跡は`us-east-1`に記録される**ためだ。
+
+```powershell
+# Account Cの認証情報で実行
+aws cloudtrail lookup-events --region us-east-1 --lookup-attributes AttributeKey=EventName,AttributeValue=UpdateAccessKey --max-results 20 --query "Events[].{Time:EventTime,User:Username,Id:EventId}" --output table
+```
+
+一方、`AssumeRole`は`ap-northeast-1`に記録されていた。イベント本文を見ると理由が書いてある。
+
+```json
+"additionalEventData": {
+  "RequestDetails": {
+    "awsServingRegion": "ap-northeast-1",
+    "endpointType": "regional"
+  }
+}
+```
+
+Lambdaのboto3がリージョナルのSTSエンドポイント(`sts.ap-northeast-1.amazonaws.com`)を使ったため、そのリージョンに記録された。グローバルエンドポイント(`sts.amazonaws.com`)を使った場合は`us-east-1`に記録される。実際、同じアカウントの`us-east-1`にも別系統の`AssumeRole`が残っていた。
+
+つまり、**1回の封じ込め動作の証跡が、IAM分は`us-east-1`、STS分は`ap-northeast-1`に分かれて記録されている**。追跡の起点を間違えると「ログが出ていない」と誤認する。
+
+オンプレのログ収集では「どのサーバーのどのログか」が物理的にはっきりしていた。AWSでは同じアカウントの中でも、サービスとエンドポイントの選択によって記録先が変わる。最初に確認すべきはログの有無ではなく、見に行く場所が合っているかどうかになる。
+
+### 成功と失敗で、記録の構造が変わる
+
+`us-east-1`の`UpdateAccessKey`を時系列に並べ、`errorCode`と操作対象を突き合わせた。
+
+```powershell
+$r = aws cloudtrail lookup-events --region us-east-1 --lookup-attributes AttributeKey=EventName,AttributeValue=UpdateAccessKey --max-results 50 | ConvertFrom-Json
+$ev = $r.Events | ForEach-Object { $_.CloudTrailEvent | ConvertFrom-Json }
+$ev | Select-Object eventTime, errorCode, @{n='target';e={$_.requestParameters.userName}} | Sort-Object eventTime | Format-Table -AutoSize
+```
+
+結果は`AccessDenied`が15件、成功が2件だった(時刻はUTC)。
+
+```
+eventTime           errorCode      target
+---------           ---------      ------
+2026/09/11 5:58:07  AccessDenied
+2026/09/11 5:58:08  AccessDenied
+  (中略: 5:58〜6:01 に AccessDenied が計15件)
+2026/09/11 6:01:28  AccessDenied
+2026/09/11 6:25:16                 test-containment-target
+2026/09/11 6:45:24                 test-containment-target
+```
+
+`6:01:28`と`6:25:16`の間が、サンプルFinding経由の検証から`lambda invoke`での直接検証に切り替えたタイミングにあたる。Part 6で書いた切り分けの経緯が、そのまま時系列として残っていた。
+
+目を引いたのは`target`列で、**失敗した15件はすべて空になっている**。成功時との差を見るため、両方のイベント本文を出した。
+
+失敗した1件(アカウントIDなどはマスク済み)。
+
+```json
+{
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAXXXXXXXXXXXXXXXXX:guardduty-containment",
+    "arn": "arn:aws:sts::333333333333:assumed-role/SecurityOpsContainmentRole/guardduty-containment",
+    "accountId": "333333333333",
+    "sessionContext": {
+      "sessionIssuer": {
+        "type": "Role",
+        "arn": "arn:aws:iam::333333333333:role/SecurityOpsContainmentRole",
+        "userName": "SecurityOpsContainmentRole"
+      },
+      "attributes": {
+        "creationDate": "2026-09-11T06:01:27Z",
+        "mfaAuthenticated": "false"
+      }
+    }
+  },
+  "eventTime": "2026-09-11T06:01:28Z",
+  "eventSource": "iam.amazonaws.com",
+  "eventName": "UpdateAccessKey",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "18.xxx.xxx.xxx",
+  "userAgent": "Boto3/1.42.97 ... exec-env/AWS_Lambda_python3.13 ...",
+  "errorCode": "AccessDenied",
+  "errorMessage": "User: arn:aws:sts::333333333333:assumed-role/SecurityOpsContainmentRole/guardduty-containment is not authorized to perform: iam:UpdateAccessKey on resource: user GeneratedFindingUserName because no identity-based policy allows the iam:UpdateAccessKey action. ...",
+  "requestParameters": null,
+  "responseElements": null
+}
+```
+
+成功した1件。
+
+```json
+{
+  "userIdentity": {
+    "type": "AssumedRole",
+    "principalId": "AROAXXXXXXXXXXXXXXXXX:guardduty-containment",
+    "arn": "arn:aws:sts::333333333333:assumed-role/SecurityOpsContainmentRole/guardduty-containment",
+    "accountId": "333333333333",
+    "accessKeyId": "ASIAXXXXXXXXXXXXXXXX",
+    "sessionContext": {
+      "sessionIssuer": {
+        "arn": "arn:aws:iam::333333333333:role/SecurityOpsContainmentRole",
+        "userName": "SecurityOpsContainmentRole"
+      },
+      "attributes": {
+        "creationDate": "2026-09-11T06:45:23Z",
+        "mfaAuthenticated": "false"
+      }
+    }
+  },
+  "eventTime": "2026-09-11T06:45:24Z",
+  "eventName": "UpdateAccessKey",
+  "awsRegion": "us-east-1",
+  "sourceIPAddress": "35.xxx.xxx.xxx",
+  "requestParameters": {
+    "userName": "test-containment-target",
+    "accessKeyId": "AKIAXXXXXXXXXXXXXXXX",
+    "status": "Inactive"
+  },
+  "responseElements": null
+}
+```
+
+同じAPIの同じ操作なのに、成否で残り方が違う。
+
+- **成功時**: `requestParameters`に`userName`・`accessKeyId`・`status`が構造化されて残る
+- **失敗時**: `requestParameters`が`null`。対象が分かるのは`errorMessage`の**文字列の中だけ**
+
+認可で拒否された時点で、リクエストパラメータが記録対象から外れているらしい。SIEMに取り込んでフィールド抽出するなら、**成否によって参照先を変えないと、失敗したケースの対象を取りこぼす**ことになる。自動対応の失敗こそ拾いたい情報なので、ここは設計に効いてくる。
+
+もう一点、`errorMessage`の文面には注意がいる。`because no identity-based policy allows the iam:UpdateAccessKey action`と書かれているが、**ポリシーはこのアクションを許可している**。許可していないのは対象リソースの方だ。文面どおりに読むとアクション自体が未許可だと思い込み、デバッグの方向を間違える。実際の`Resource`指定と突き合わせるまで、メッセージだけで判断しない方がよい。
+
+### 誰がやったのかは1行で分かる
+
+`RoleSessionName`に指定した`guardduty-containment`が、`lookup-events`の`User`列にそのまま出る。
+
+```
+| Id                                   | Time                      | User                  |
+| 2a6e623f-90f2-44e4-ae81-4c39d36bf102 | 2026-09-11T15:45:24+09:00 | guardduty-containment |
+| a80e0940-4057-42ad-857a-a099601e153a | 2026-09-11T15:25:16+09:00 | guardduty-containment |
+| f66244ae-02b1-4f93-8a70-538722fdcf66 | 2026-09-11T15:01:28+09:00 | guardduty-containment |
+```
+
+この節を書くにあたり、最初にAccount Aで同じコマンドを流してしまったのだが、そのときの`User`列には、作業に使っていたIAMユーザーの名前が出ていた。**一覧の1列を見るだけで、自動対応の結果か人手のオペレーションかが判別できる**。ここが`session1`のような無意味な名前だと、まずAccount B側のログを引いて呼び出し元を特定するところから始まり、調査の初動が1ステップ増える。
+
+判別材料はもう1つある。`userAgent`に`exec-env/AWS_Lambda_python3.13`が入っているので、Lambdaからの実行であることが独立して確認できる。セッション名とuserAgentの2つで裏が取れる形になる。
+
+ロール名も同様で、`sessionIssuer.userName`に`SecurityOpsContainmentRole`がそのまま出る。命名は可読性の話に見えて、実際にはログの可読性、つまり調査速度の話になる。
+
+一方、`sourceIPAddress`はこの用途には使えない。失敗時が`18.183.x.x`、成功時が`35.78.x.x`で、どちらも東京リージョンのAWS範囲だが値が違う。Lambdaの実行環境が入れ替わっているためで、送信元IPを固定値として扱うことはできない。逆に言えば、**このロールがAWS外のIPから使われていたら、それ自体が異常**ということになる。封じ込めロールの監視指標としてはそちらの使い方になる。
+
+### 入られた側のログだけでは、相手の名前が分からない
+
+`AssumeRole`を両方のアカウントで引いて比べた。同じ1回の呼び出しが、両方に記録されている。
+
+Account C(入られた側)に残っていた`userIdentity`。
+
+```json
+"userIdentity": {
+  "type": "AWSAccount",
+  "principalId": "AROAYYYYYYYYYYYYYYYYY:guardduty-containment",
+  "accountId": "222222222222"
+}
+```
+
+`type`が`AWSAccount`で、**`arn`フィールドが存在しない**。分かるのはAccount BのアカウントIDと、ロールのユニークID(`AROA`で始まる文字列)だけで、`GuardDutyContainmentLambdaRole`という名前はどこにも出てこない。`lookup-events`の`User`列が空になるのもこのためだ。
+
+これはPart 2で書いた「信頼ポリシーの`Principal`はユニークIDに内部変換される」という仕様の、事後調査側での現れ方になる。構築時には作成順序の制約として出てきた同じ仕様が、調査時には「相手の素性が名前で読めない」という形で跳ね返ってくる。
+
+一方、Account B(入った側)の同じイベントには、呼び出し元がそのまま残っていた。
+
+```
+eventTime          caller                                                                                       sharedEventID
+2026/09/11 6:45:23 arn:aws:sts::222222222222:assumed-role/GuardDutyContainmentLambdaRole/guardduty-containment  fe4bc436-…
+```
+
+そして両者を結び付ける鍵が`sharedEventID`になる。CloudTrailは複数アカウントに同じイベントを記録する際、共通のIDを振る。Account C側の`fe4bc436-…`と、Account B側の`fe4bc436-…`が一致した。
+
+| | Account C(入られた側) | Account B(入った側) |
+|---|---|---|
+| `userIdentity.type` | `AWSAccount` | `AssumedRole` |
+| 呼び出し元のARN | なし | ロール名まで判明 |
+| 分かること | アカウントIDとユニークIDのみ | ロール名とセッション名 |
+| 結合キー | `sharedEventID`(共通) | 同左 |
+
+**片方のログだけでは全体が追えず、2つのアカウントを突き合わせて初めて確定する。** 侵害されたアカウント側のログしか手元にない状況では、相手のアカウントIDまでは分かるが、その中の誰かは分からない。名前に解決するには、相手アカウントの協力が要る。
+
+Account C側の`AssumeRole`には、`requestParameters`も残っていた。
+
+```json
+"requestParameters": {
+  "roleArn": "arn:aws:iam::333333333333:role/SecurityOpsContainmentRole",
+  "roleSessionName": "guardduty-containment",
+  "externalId": "guardduty-containment-verify"
+},
+"responseElements": {
+  "assumedRoleUser": {
+    "assumedRoleId": "AROAXXXXXXXXXXXXXXXXX:guardduty-containment",
+    "arn": "arn:aws:sts::333333333333:assumed-role/SecurityOpsContainmentRole/guardduty-containment"
+  }
+}
+```
+
+`externalId`が記録されている点は、事前に確信が持てていなかったので確認できてよかった。設計編で書いたExternalIdの役割が、事後に「正しい値が提示されていたか」という形で検証できる。
+
+`responseElements.assumedRoleUser.arn`は、成功した`UpdateAccessKey`の`userIdentity.arn`と完全に一致する。払い出された`accessKeyId`(`ASIA...`)と`sourceIPAddress`も一致していたので、**3つの独立したフィールドで同一セッションだと確定できた**。「このAssumeRoleで得た権限が、この封じ込めを実行した」という因果が、推測ではなくログで追える。
+
+### 封じ込めの前後を突き合わせる
+
+`UpdateAccessKey`の記録だけでは「止めた」ことしか分からない。実インシデントであれば、同じアクセスキーIDを軸にして、
+
+1. そのキーによる`AssumeRole`や各種API呼び出しが、いつからいつまで行われていたか
+2. `sourceIPAddress`・`userAgent`が通常の運用パターンから外れていないか
+3. 封じ込め以降、そのキーによる呼び出しが実際に止まっているか
+
+を追うことになる。
+
+3が重要で、**キーを無効化しても、そのキーで既に発行済みのSTS一時認証情報は失効しない**。攻撃者が事前に`AssumeRole`や`GetSessionToken`を済ませていれば、セッションの有効期限まで活動を続けられる。今回のログでも、AssumeRoleで得たセッションの`expiration`は発行から1時間後になっていた。「封じ込めたのにAPI呼び出しが止まっていない」はここで判明する。
+
+EDRで端末をネットワーク隔離したつもりが、確立済みのセッションだけ生き残っていた、というのと同じ構造になる。**遮断したのは新規の認証であって、既存のセッションではない**。この点への対処は「この実装の問題点」に書いた。
+
+なお、アクセスキーIDそのものは`AKIA`、一時認証情報は`ASIA`で始まる。今回のログでも、封じ込めを実行した側のセッションが`ASIA...`、止められた対象が`AKIA...`と、接頭辞だけで何が何を止めたのかが読み取れる状態になっていた。
+
+---
+
+## この実装の問題点
+
+検証を通して、動くことは確認できたが、そのまま本番に持っていけない箇所もはっきりした。記事の締めとして、コードを直す前提で整理しておく。
+
+### 1. 封じ込め対象の判定が、狭すぎて広すぎる
+
+```python
+if "UnauthorizedAccess:IAMUser" in finding_type or "AccessKey" in finding_type:
+```
+
+問題は2つある。
+
+**後半の条件は一度も成立しない。** `AccessKey`という文字列が現れるのは`resource.resourceType`の値であって、`detail.type`ではない。GuardDutyのFindingタイプは`UnauthorizedAccess:IAMUser/...`、`CredentialAccess:IAMUser/...`のような形式で、`AccessKey`という語は含まれない。書いた本人は「二重に拾っているから安心」と思っていたが、実際には片方しか動いていなかった。
+
+**前半の条件は対象が狭い。** `UnauthorizedAccess:IAMUser`しか拾えないので、`CredentialAccess:IAMUser/AnomalousBehavior`、`Exfiltration:IAMUser/AnomalousBehavior`、`Impact:IAMUser/AnomalousBehavior`といった、まさに認証情報の侵害を示すFindingを取りこぼす。
+
+**`userType`を見ていない。** `accessKeyDetails.userType`は`IAMUser`以外に`AssumedRole`・`Root`・`FederatedUser`を取る。`AssumedRole`の場合、`userName`に入るのはロール名なので`update_access_key`は必ず失敗する。`Root`はそもそもこの方法では止められない。いずれも「自動では対処できないので人間に回す」と判定すべきケースで、黙って失敗させてよいものではない。
+
+タイプ名の文字列一致ではなく、`resourceType`と`userType`で判定するのが正しい。
+
+### 2. 失敗したときに通知が飛ばない
+
+前述の通り。`SNS.publish`を`try/finally`に入れ、成否にかかわらず必ず通知する。加えて、例外は握りつぶさずに再送出してDLQへ送る。
+
+### 3. アクセスキーを止めても、既存セッションは止まらない
+
+これが設計上いちばん大きい穴だと思う。`UpdateAccessKey`で`Inactive`にすると、そのキーを使った**新規の**認証は通らなくなる。しかし、攻撃者が事前に`GetSessionToken`や`AssumeRole`を済ませていれば、**発行済みの一時認証情報は有効期限まで生き続ける**。
+
+対処するには封じ込めを2段階にする必要がある。
+
+- **キーの無効化**: `iam:UpdateAccessKey` — 新規認証を止める
+- **セッションの失効**: 侵害されたIAMユーザーに全拒否のインラインポリシーを付与する。IAMユーザーの権限から派生した一時認証情報は、ユーザー側のDenyの影響を受けるため、発行済みセッションも止まる。`userType`が`AssumedRole`の場合は対象がロール側になるので、`aws:TokenIssueTime`条件付きのDenyポリシーをロールに付ける(コンソールの「アクティブなセッションの取り消し」と同じ手法)
+
+ただしこれをやるには`iam:PutUserPolicy`・`iam:PutRolePolicy`が必要になり、封じ込めロールの権限は明確に強くなる。**封じ込めを徹底するほど、封じ込め用ロール自体が高価値な攻撃対象になる**というトレードオフがそのまま出てくる。実装するなら、このロールをSCPで保護する、変更をCloudTrailで監視するといった対策とセットで考える必要がある。
+
+### 4. 監視範囲がリージョン1つ分しかない
+
+GuardDutyもEventBridgeもリージョナルサービスなので、今回作ったルールは`ap-northeast-1`のFindingしか拾わない。他リージョンで攻撃者がリソースを立ち上げた場合、検知はされても自動封じ込めは走らない。使っていないリージョンほど気づかれにくいので、実運用では全リージョンに同じルールを展開するか、イベントを1リージョンに集約する構成が要る。
+
+### 修正版
+
+上の1〜2と、使っていなかった`iam:ListAccessKeys`の削除を反映したもの。3と4は構成自体の変更が必要になるので、ここには含めていない。
+
+```python
+import boto3
+import os
+import json
+import logging
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+
+STS = boto3.client("sts")
+SNS = boto3.client("sns")
+
+TARGET_ACCOUNT_ID = os.environ["TARGET_ACCOUNT_ID"]
+CONTAINMENT_ROLE_NAME = "SecurityOpsContainmentRole"
+EXTERNAL_ID = "guardduty-containment-verify"
+SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
+
+
+def notify(payload):
+    subject = f"[GuardDuty][{payload['status']}] {payload['findingType']}"
+    SNS.publish(
+        TopicArn=SNS_TOPIC_ARN,
+        Subject=subject[:100],  # SNSのSubjectは100文字まで
+        Message=json.dumps(payload, ensure_ascii=False, indent=2),
+    )
+
+
+def lambda_handler(event, context):
+    detail = event["detail"]
+    payload = {
+        "findingType": detail["type"],
+        "severity": detail["severity"],
+        "title": detail.get("title", ""),
+        "sourceAccount": detail["accountId"],
+        "status": "NO_ACTION",
+        "actionTaken": "none",
+    }
+
+    try:
+        resource = detail.get("resource", {})
+        key_details = resource.get("accessKeyDetails")
+
+        # アクセスキー起因のFindingでなければ通知のみ
+        if resource.get("resourceType") != "AccessKey" or not key_details:
+            payload["actionTaken"] = "not an access key finding"
+            return payload
+
+        user_type = key_details.get("userType")
+        if user_type != "IAMUser":
+            # AssumedRole / Root / FederatedUser は自動対処できない。人間に回す
+            payload["status"] = "MANUAL_REQUIRED"
+            payload["actionTaken"] = f"userType={user_type}: cannot disable via UpdateAccessKey"
+            return payload
+
+        user_name = key_details["userName"]
+        access_key_id = key_details["accessKeyId"]
+
+        assumed = STS.assume_role(
+            RoleArn=f"arn:aws:iam::{TARGET_ACCOUNT_ID}:role/{CONTAINMENT_ROLE_NAME}",
+            RoleSessionName="guardduty-containment",
+            ExternalId=EXTERNAL_ID,
+        )
+        creds = assumed["Credentials"]
+        iam_c = boto3.client(
+            "iam",
+            aws_access_key_id=creds["AccessKeyId"],
+            aws_secret_access_key=creds["SecretAccessKey"],
+            aws_session_token=creds["SessionToken"],
+        )
+
+        iam_c.update_access_key(
+            AccessKeyId=access_key_id,
+            Status="Inactive",
+            UserName=user_name,
+        )
+        payload["status"] = "CONTAINED"
+        payload["actionTaken"] = f"disabled access key {access_key_id} for user {user_name}"
+        return payload
+
+    except Exception as exc:
+        payload["status"] = "FAILED"
+        payload["actionTaken"] = f"{type(exc).__name__}: {exc}"
+        logger.exception("containment failed")
+        raise  # 再送出してDLQへ送る
+
+    finally:
+        # 成否にかかわらず必ず通知する。通知の失敗で元の例外を隠さない
+        try:
+            notify(payload)
+        except Exception:
+            logger.exception("notification failed")
+```
+
+変更点は3つ。
+
+- **`finally`で必ず通知する**。成功・対象外・失敗のいずれでも`status`付きで届く。Subjectの先頭に`status`を置いたので、メールの一覧画面で`FAILED`だけを拾える
+- **例外を再送出する**。EventBridgeの非同期呼び出しは失敗すると2回リトライし、それでも失敗すればイベントは破棄される。DLQ(SQS)を設定しておけば、失敗したイベント本体が残るので後から追跡できる。ただしリトライのたびに通知も飛ぶので、同じ失敗が3通届くことになる。ここはDLQと通知のどちらを優先するかの判断が要る
+- **`userType`で分岐する**。自動対処できないケースを`MANUAL_REQUIRED`として明示的に人間へ渡す。「自動化の対象外である」という判断自体を通知に含めておかないと、対応漏れになる
+
+`update_access_key`で`Inactive`にする操作自体は、同じFindingが再送されて2回走っても結果が変わらないので、冪等性の観点では問題ない。
 
 ---
 
@@ -843,10 +1376,14 @@ aws iam list-access-keys --user-name test-containment-target
 
 | 要件 | 確認方法 | 結果 |
 |---|---|---|
-| 1. 検知 | GuardDutyのFinding生成 | ○ |
-| 2. 自動封じ込め | Lambda直接起動 + IAMコンソールでのStatus確認 | ○(サンプルFinding経由では要検証だが、直接テストで確認) |
-| 3. SNS通知 | サブスクリプション確認・メール受信 | ○ |
-| 4. 検出結果の集約 | `list-findings` + `AccountId`フィールドの裏取り | ○ |
+| 1. 検知 | GuardDutyのFinding生成、`list-findings` | ○ |
+| 2. 自動封じ込め | Lambda直接起動 + `list-access-keys`・IAMコンソールでのStatus確認 | ○(サンプルFinding経由では原理上検証できないため、実キーを含むテストイベントで確認) |
+| 3. SNS通知 | サブスクリプション確認・メール受信 | △(通知経路は機能。ただし封じ込め失敗時に通知されない欠陥あり) |
+| 4. 検出結果の集約 | `list-findings` + `get-findings`の`AccountId`で裏取り | ○ |
+
+一方、当初の要件には入れていなかったが、実際に追跡できるかを確かめたのがPart 6.5になる。結論として、**封じ込めの一連の動作は証跡から再構成できた**。`RoleSessionName`で自動対応か人手かが判別でき、`sharedEventID`でAccount BとCのログが結合でき、`AssumeRole`と`UpdateAccessKey`が同一セッションであることも3つのフィールドで確定できた。
+
+ただし、片方のアカウントのログだけでは足りない。封じ込めを受けたAccount C側には呼び出し元のロール名が残らず、分かるのはアカウントIDとユニークIDまでだった。また、`UpdateAccessKey`が失敗したケースでは`requestParameters`が記録されず、操作対象は`errorMessage`の文字列からしか読めなかった。**追跡できるかどうかは、成否とどちらのアカウントを見るかで変わる**というのが、この検証で一番の収穫になった。
 
 ## コスト
 
@@ -890,6 +1427,12 @@ aws lambda delete-function --function-name guardduty-containment
 aws sns delete-topic --topic-arn <SNSトピックのARN>
 aws iam delete-role-policy --role-name GuardDutyContainmentLambdaRole --policy-name lambda-permissions
 aws iam delete-role --role-name GuardDutyContainmentLambdaRole
+```
+
+`lambda delete-function`ではCloudWatch Logsのロググループは消えない。関数を消したあとも`/aws/lambda/<関数名>`は残り続け、既定では保持期間が無期限のため、消し忘れるとログだけが積み上がる。今回の規模なら課金額は無視できるが、検証を繰り返す環境では確実にゴミが溜まるので一緒に消す。
+
+```bash
+aws logs delete-log-group --log-group-name /aws/lambda/guardduty-containment
 ```
 
 ![Account B側の各種リソースが削除された様子](/images/cleanup-03-account-b-resources-deleted.png)
@@ -959,9 +1502,21 @@ Account B・Cそれぞれで実行後、`list-detectors`が空配列を返すこ
 
 これで、両アカウントのGuardDutyが無効化されたことが確認できた。
 
-Account B・Cのアカウント自体(器)をクローズするかどうかは、また別の判断になる。Organizations配下から「独立アカウント化」する場合は電話番号認証が必要になる点に注意。単なるメンバーアカウントの閉鎖であれば別フロー(実施時に最新のAWS公式ドキュメントで確認すること)。
+### Organizations側の連携解除
 
----
+最後に、Part 1の最初に有効化したGuardDutyへのサービスアクセスも戻しておく。これを残しておくとOrganizations側にGuardDutyとの信頼関係が残り続ける。
+
+```bash
+# Account Aの認証情報で実行
+aws organizations disable-aws-service-access \
+  --service-principal guardduty.amazonaws.com
+
+aws organizations list-aws-service-access-for-organization
+```
+
+`list-aws-service-access-for-organization`の結果から`guardduty.amazonaws.com`が消えていれば完了。
+
+Account B・Cのアカウント自体(器)をクローズするかどうかは、また別の判断になる。Organizations配下から「独立アカウント化」する場合は電話番号認証が必要になる点に注意。単なるメンバーアカウントの閉鎖であれば別フロー(実施時に最新のAWS公式ドキュメントで確認すること)。
 
 ## この記事で得られた気づきのまとめ
 
@@ -971,10 +1526,13 @@ Account B・Cのアカウント自体(器)をクローズするかどうかは�
 2. **IAMロールの信頼関係には作成順序の依存がある**。信頼される側を先に作る必要がある。権限ポリシーの`Resource`は実在チェックされないのに、信頼ポリシーの`Principal`はチェックされる、という非対称性が理由だった
 3. **メンバーアカウント同士は直接AssumeRoleできない**。必ず管理アカウントを経由する
 4. **CLIでEventBridge→Lambda連携を組む場合、`lambda add-permission`を自分で叩く必要がある**。コンソール操作と違って自動付与されない
-5. **サンプルFinding機能は全種類を一括生成し、ダミーのリソース識別子を含む**。検知パイプラインの確認には使えるが、実際の封じ込めアクションの検証には向いていない
+5. **サンプルFinding機能は全種類を一括生成し、ダミーのリソース識別子を含む**。検知パイプラインの確認には使えるが、実際の封じ込めアクションの検証には向いていない。権限を緩めても解決しない(実在しないユーザーなので`NoSuchEntity`になるだけ)ので、これは権限の問題ではなくテストデータの問題だった
 6. **最小権限ポリシーは、意図しない対象への操作を「正しく」拒否してくれる**。今回のダミーユーザーへの操作拒否は、まさにこの設計が効いた場面だった
+7. **自動対応では、成功より失敗の通知の方が重要になる**。`SNS.publish`を処理の末尾に置いていたため、封じ込めが失敗したときだけ通知が飛ばない構成になっていた。ログを見に行かなければ気づけなかった
+8. **IAMの証跡は`us-east-1`に記録される**。グローバルサービスのため、作業リージョンのCloudTrailを見ても`UpdateAccessKey`は出てこない
+9. **`RoleSessionName`とロール名は、事後調査の速度に直結する**。CloudTrailの`sessionContext`にそのまま出るので、意味のある名前を付けておくと「人手か自動対応か」を1行で判別できる
 
-いずれも、設計編で立てた構成そのものを覆すものではなかったが、実装の細部では想定と異なる挙動がいくつもあり、実機検証の価値を改めて感じた。
+構成そのものを覆すものはなかったが、実装の細部では想定と異なる挙動がいくつもあった。特に7は、コードを書いた時点でもレビュー時点でも気づかず、実際にエラーを踏んで初めて分かった。設計の正しさと実装の正しさは別物で、後者は動かさないと分からない。
 
 ## 次にやること: コード化
 
